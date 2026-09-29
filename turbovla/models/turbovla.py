@@ -13,6 +13,7 @@ from .components.transformer import TransformerEncoderLayer
 from .components.utils import _get_clones
 from .configuration import (
     ActionHeadConfig,
+    CTSConfig,
     InteractionConfig,
     TextEncoderConfig,
     TurboVLAConfig,
@@ -72,27 +73,50 @@ class VisionLanguageInteraction(nn.Module):
         text_tokens: torch.Tensor,
         text_key_padding_mask: torch.Tensor,
         text_self_attention_masks: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cts_state: list | None = None,
+        return_state: bool = False,
+    ):
         zero_fill = self.padding_strategy == "zero_fill"
         if zero_fill:
             text_tokens = text_tokens.masked_fill(text_key_padding_mask.unsqueeze(-1), 0.0)
 
-        for fusion_layer, text_layer in zip(self.fusion_layers, self.text_layers):
-            visual_tokens, text_tokens = fusion_layer(
-                v=visual_tokens,
-                l=text_tokens,
-                attention_mask_v=None,
-                attention_mask_l=text_key_padding_mask,
-            )
+        final_states = []
+        for index, (fusion_layer, text_layer) in enumerate(zip(self.fusion_layers, self.text_layers)):
+            layer_state = (cts_state[index] if cts_state is not None else None) or {}
+            if return_state:
+                visual_tokens, text_tokens, cross_state = fusion_layer(
+                    v=visual_tokens,
+                    l=text_tokens,
+                    attention_mask_v=None,
+                    attention_mask_l=text_key_padding_mask,
+                    cts_state=layer_state.get("cross"),
+                    return_state=True,
+                )
+            else:
+                visual_tokens, text_tokens = fusion_layer(
+                    v=visual_tokens,
+                    l=text_tokens,
+                    attention_mask_v=None,
+                    attention_mask_l=text_key_padding_mask,
+                )
             source_mask = None if text_self_attention_masks is None else ~text_self_attention_masks
-            text_tokens = text_layer(
+            text_kwargs = dict(
                 src=text_tokens.transpose(0, 1),
                 src_mask=source_mask,
                 src_key_padding_mask=None if zero_fill else text_key_padding_mask,
                 pos=None,
-            ).transpose(0, 1)
+            )
+            if return_state:
+                text_tokens, text_state = text_layer(
+                    **text_kwargs, initial_state=layer_state.get("text"), return_state=True)
+                final_states.append({"cross": cross_state, "text": text_state})
+            else:
+                text_tokens = text_layer(**text_kwargs)
+            text_tokens = text_tokens.transpose(0, 1)
             if zero_fill:
                 text_tokens = text_tokens.masked_fill(text_key_padding_mask.unsqueeze(-1), 0.0)
+        if return_state:
+            return visual_tokens, text_tokens, final_states
         return visual_tokens, text_tokens
 
 
@@ -229,6 +253,12 @@ class TurboVLA(nn.Module):
                 )
                 head.load_common(self.action_head)
                 self.action_head = head
+        if config.cts.enabled:
+            from ..cts.apply import apply_cts
+            # New CTS parameters are deterministic; unchanged modules keep
+            # their constructed values and RNG consumption.
+            with torch.random.fork_rng(devices=[]):
+                apply_cts(self)
 
     def _normalize_samples(self, samples: torch.Tensor | Mapping[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(samples, Mapping):
@@ -396,14 +426,173 @@ class TurboVLA(nn.Module):
             return condition, initial_visual.mean(0)
         return condition
 
-    def forward(
+    def forward_cts(
         self,
         instructions: Sequence[str],
         samples: torch.Tensor | Mapping[str, torch.Tensor],
         state: torch.Tensor,
+        carry: dict | None = None,
+        return_distillation_features: bool = False,
+    ):
+        """One control query of Control-Time Spiking.
+
+        `carry` is the episode state returned by the previous query (None at
+        episode start). Returns (actions, new_carry) or, with features,
+        (actions, new_carry, features). The carry is never mutated in place.
+        """
+        cts = self.config.cts
+        if not cts.enabled:
+            raise RuntimeError("forward_cts requires config.cts.enabled")
+        from ..cts.state import wrap_carried
+        from .components.wta_operators import checkpoint_contexts
+
+        carry = carry or {}
+        new_carry: dict[str, Any] = {}
+        pixel_values = self._normalize_samples(samples)
+        device = pixel_values.device
+
+        # The frozen text backbone sees a constant instruction; encode it once per episode.
+        text_cache = carry.get("instruction")
+        if text_cache is None:
+            hidden, valid_tokens, sentence_allowed = self.text_encoder.encode_bert_hidden(instructions, device)
+            if hidden.shape[0] != pixel_values.shape[0]:
+                raise ValueError("Instruction batch size does not match image batch size")
+            text_cache = (hidden.to(self.text_encoder.text_projection.weight.dtype), valid_tokens, sentence_allowed)
+        new_carry["instruction"] = text_cache
+        hidden, valid_tokens, sentence_allowed = text_cache
+        valid = valid_tokens[..., None]
+        raw_visual = self.vision_encoder(pixel_values).to(self.vision_projection.skip.weight.dtype)
+
+        def project(vision, text, init):
+            init = init or {}
+            v_state, l_state = wrap_carried(init.get("vision")), wrap_carried(init.get("text"))
+            visual, language = [], []
+            for t in range(self.config.interaction.cross_timesteps):
+                current = self.vision_projection.forward_step(vision, v_state, time_index=t)
+                visual.append(self._position_visual_tokens(current).flatten(1, 2))
+                language.append(self.text_encoder.text_projection.forward_step(text, l_state, valid, time_index=t))
+            return torch.stack(visual), torch.stack(language), {"vision": v_state, "text": l_state}
+
+        projection_in = carry.get("projection") if cts.carry_projection else None
+        if (self.training and torch.is_grad_enabled()
+                and self.config.interaction.projection_gradient_checkpointing):
+            visual, language, projection_state = checkpoint(
+                project, raw_visual, hidden, projection_in, use_reentrant=False, context_fn=checkpoint_contexts)
+        else:
+            visual, language, projection_state = project(raw_visual, hidden, projection_in)
+        if cts.carry_projection:
+            new_carry["projection"] = projection_state
+        initial_visual, initial_text = visual.mean(0), language.mean(0)
+
+        fusion_in = carry.get("fusion")
+        visual, language, fusion_state = self.vision_language_interaction(
+            initial_visual, initial_text, ~valid_tokens, sentence_allowed,
+            cts_state=fusion_in, return_state=True,
+        )
+        if cts.carry_fusion or cts.memory or cts.memory_vision:
+            new_carry["fusion"] = [
+                {"cross": {"attn": layer["cross"]["attn"] if cts.carry_fusion else None,
+                           "memory": layer["cross"]["memory"], "memory_v": layer["cross"]["memory_v"]},
+                 "text": layer["text"] if cts.carry_fusion else None}
+                for layer in fusion_state
+            ]
+        condition = torch.cat([visual, language], dim=1)
+
+        action_dtype = self.action_head.decoder.action_queries.weight.dtype
+        condition, state = condition.to(dtype=action_dtype), state.to(dtype=action_dtype)
+        if self.config.action.head_type == "ann":
+            actions = self.action_head(condition, state)
+        else:
+            visual_padding = torch.zeros(visual.shape[:2], dtype=torch.bool, device=condition.device)
+            padding = torch.cat((visual_padding, ~valid_tokens), dim=1)
+            memory = condition
+            if cts.history_tokens:
+                # E3 baseline: explicit previous-query visual tokens, no neuron state needed.
+                previous = carry.get("history")
+                previous_valid = carry.get("history_valid")
+                if previous is None:
+                    previous = torch.zeros_like(visual)
+                    previous_valid = torch.zeros(visual.shape[0], dtype=torch.bool, device=visual.device)
+                memory = torch.cat((condition, previous.to(action_dtype)), dim=1)
+                padding = torch.cat((padding, (~previous_valid)[:, None].expand(-1, visual.shape[1])), dim=1)
+                new_carry["history"] = visual
+                new_carry["history_valid"] = torch.ones(visual.shape[0], dtype=torch.bool, device=visual.device)
+            head_in = carry.get("head") if cts.carry_head else None
+            actions, head_state = self.action_head(
+                memory, state, memory_key_padding_mask=padding, initial_state=head_in, return_state=True)
+            if cts.carry_head:
+                new_carry["head"] = head_state
+        new_carry["query_index"] = int(carry.get("query_index", -1)) + 1
+        if return_distillation_features:
+            features = {"visual": initial_visual, "text": initial_text, "text_valid": valid_tokens}
+            return actions, new_carry, features
+        return actions, new_carry
+
+    def forward_window(
+        self,
+        queries: Sequence[tuple[Sequence[str], Any, torch.Tensor]],
+        present: torch.Tensor,
+        burn_in: int,
+        state_dropout: float = 0.0,
+        return_distillation_features: bool = False,
+    ):
+        """C3: run Q consecutive control queries of a batch of episodes.
+
+        queries[j] = (instructions, samples, state). The first `burn_in` queries
+        run without gradients and only warm up the carry. present[b, j] is False
+        for burn-in queries before the episode start; the state is zeroed after
+        them. Before every loss query the state of each sample is dropped with
+        probability `state_dropout`. Returns actions [B, K, H, A] for the K loss
+        queries (and their distillation features as a list).
+        """
+        from ..cts.state import detach_carry, reset_samples
+
+        if not 0 <= burn_in < len(queries):
+            raise ValueError("burn_in must leave at least one loss query")
+        carry, actions, features = None, [], []
+        for index, (instructions, samples, state) in enumerate(queries):
+            loss_query = index >= burn_in
+            with (nullcontext() if loss_query else torch.no_grad()):
+                result = self.forward_cts(
+                    instructions, samples, state, carry,
+                    return_distillation_features=loss_query and return_distillation_features,
+                )
+            if loss_query:
+                actions.append(result[0])
+                if return_distillation_features:
+                    features.append(result[2])
+                carry = result[1]
+            else:
+                carry = detach_carry(result[1])
+            if index + 1 < len(queries):
+                keep = present[:, index].to(device=result[0].device)
+                if index + 1 >= burn_in and state_dropout > 0 and self.training:
+                    keep = keep & (torch.rand(keep.shape, device=keep.device) >= state_dropout)
+                carry = reset_samples(carry, keep)
+        stacked = torch.stack(actions, dim=1)
+        return (stacked, features) if return_distillation_features else stacked
+
+    def forward(
+        self,
+        instructions: Sequence[str] | None,
+        samples: torch.Tensor | Mapping[str, torch.Tensor] | None,
+        state: torch.Tensor | None,
         return_visual_tokens: bool = False,
         return_distillation_features: bool = False,
+        cts_window: Mapping[str, Any] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+        if cts_window is not None:
+            # Routed through forward so DDP sees one forward per backward.
+            return self.forward_window(**cts_window, return_distillation_features=return_distillation_features)
+        if self.config.cts.enabled:
+            # A stateless call is one cold-start control query.
+            actions, _, features = self.forward_cts(
+                instructions, samples, state, None, return_distillation_features=True)
+            if return_distillation_features:
+                return actions, features
+            if return_visual_tokens:
+                return actions, features["visual"]
+            return actions
         spike_action_head = self.config.action.head_type in {
             "spike_sdsa", "deep_spike_wta", "full_spike_state8_wta", "full_spike_state8_shiftmax", "full_spike_state8_shiftmax_continuous_inputs", "full_spike_state8_shiftmax_continuous_inputs_ann_ffn", "full_spike_state8_shiftmax_ann_ffn",
         }
@@ -558,5 +747,17 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 state_hidden_dim=int(_arg(args, "act_state_hidden_dim", 256)),
                 dropout=float(_arg(args, "act_dropout", 0.1)),
             ),
+            cts=cts_config_from_args(args),
         )
     return TurboVLA(config)
+
+
+def cts_config_from_args(args: Any) -> CTSConfig:
+    """Read `cts_*` attributes (CLI names) into a CTSConfig; absent means disabled."""
+    defaults = CTSConfig()
+    values = {}
+    for name in CTSConfig.__dataclass_fields__:
+        default = getattr(defaults, name)
+        value = _arg(args, "cts_" + name, default)
+        values[name] = type(default)(value) if value is not None else default
+    return CTSConfig(**values)

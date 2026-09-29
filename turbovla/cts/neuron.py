@@ -1,0 +1,137 @@
+"""Control-Time Spiking neuron and persistent dendritic memory.
+
+CTSNeuron keeps the caller-owned membrane interface of BipolarPLIF /
+FunctionalPLIF, so it drops into existing `spike_nodes` containers:
+
+    spike, membrane = node(current, membrane, threshold_scale=1.0, valid=None)
+
+Charge forms (g = sigmoid(decay_logit), the existing learnable scalar):
+    plif: v = u + g * (I - u)     EMA toward I; the base neuron
+    if:   v = u + g * I           accumulates evidence; g is an input gain
+Reset forms:
+    hard: u = v * (1 - |s|)       base behaviour, drops the residual
+    soft: u = v - theta * s       keeps the quantization residual
+          (optionally clamped to [-theta, theta] to prevent wind-up)
+
+A membrane wrapped in `Carried` comes from the previous control query of the
+same episode. It is scaled by a learnable per-channel retention before the
+first step of the new query. Within a query the neuron is identical to the
+non-carried case, so plif_hard without Carried inputs equals the base neuron.
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+from torch import nn
+
+from ..models.components.spike_fusion import _ATanSpike
+
+
+class Carried:
+    """Marks a membrane that crossed a control-query boundary."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: torch.Tensor):
+        self.value = value
+
+
+def _logit(p: float) -> float:
+    return math.log(p / (1.0 - p))
+
+
+class CTSNeuron(nn.Module):
+    def __init__(self, channels: int, *, bipolar: bool, charge: str = "if", reset: str = "soft",
+                 residual_clamp: bool = True, carry: bool = False, retention_init: float = 0.9,
+                 retention_learnable: bool = True, decay_logit: float = 0.0, log_threshold: float = math.log(0.5)):
+        super().__init__()
+        if charge not in {"plif", "if"} or reset not in {"hard", "soft"}:
+            raise ValueError(f"Unknown CTS neuron form {charge}_{reset}")
+        self.channels, self.bipolar = int(channels), bool(bipolar)
+        self.charge, self.reset, self.residual_clamp = charge, reset, bool(residual_clamp)
+        # Same parameter names/shapes as FunctionalPLIF, so the existing
+        # optimizer grouping and "spike_nodes" exclusions apply unchanged.
+        self.decay_logit = nn.Parameter(torch.tensor(float(decay_logit)))
+        self.log_threshold = nn.Parameter(torch.tensor(float(log_threshold)))
+        self.carry = bool(carry)
+        if self.carry:
+            value = torch.full((self.channels,), _logit(float(retention_init)))
+            if retention_learnable:
+                self.retention_logit = nn.Parameter(value)
+            else:
+                self.register_buffer("retention_logit", value)
+        else:
+            self.register_parameter("retention_logit", None)
+
+    def extra_repr(self):
+        return (f"channels={self.channels}, bipolar={self.bipolar}, form={self.charge}_{self.reset}, "
+                f"clamp={self.residual_clamp}, carry={self.carry}")
+
+    def retention(self) -> torch.Tensor:
+        if self.retention_logit is None:
+            raise RuntimeError("This neuron was built without control-time carry")
+        return self.retention_logit.sigmoid()
+
+    def forward(self, current, membrane=None, threshold_scale=1.0, valid=None):
+        if isinstance(membrane, Carried):
+            if not self.carry:
+                raise RuntimeError("Carried membrane passed to a neuron without carry")
+            membrane = membrane.value * self.retention()
+        if membrane is None:
+            membrane = torch.zeros_like(current)
+        gain = self.decay_logit.sigmoid()
+        if self.charge == "plif":
+            voltage = membrane + gain * (current - membrane)
+        else:
+            voltage = membrane + gain * current
+        threshold = self.log_threshold.exp() * threshold_scale
+        normalized = voltage / threshold
+        spike = _ATanSpike.apply(normalized - 1.0)
+        if self.bipolar:
+            spike = spike - _ATanSpike.apply(-normalized - 1.0)
+        if valid is not None:
+            spike = spike.masked_fill(~valid, 0.0)
+            voltage = voltage.masked_fill(~valid, 0.0)
+        fired = spike.detach()
+        if self.reset == "hard":
+            membrane = voltage * (1.0 - fired.abs())
+        else:
+            membrane = voltage - threshold * fired
+            if self.residual_clamp:
+                bound = threshold.detach() if torch.is_tensor(threshold) else threshold
+                membrane = torch.maximum(torch.minimum(membrane, bound), -bound)
+        return spike, membrane
+
+
+class DendriticMemory(nn.Module):
+    """C2: non-resetting per-channel trace across control queries.
+
+    m_k = rho * m_{k-1} + (1 - rho) * w_k, m_0 = w_0 (bias-free warm start).
+    rho_c = exp(-1 / tau_c) with tau log-spaced in [tau_min, tau_max] queries.
+    The stream receives gain * m_k. It is a continuous dendritic variable,
+    disclosed as such; spikes are still generated by the next layer's neurons.
+    """
+
+    def __init__(self, channels: int, tau_min: float = 1.0, tau_max: float = 16.0, gain_init: float = 1e-4):
+        super().__init__()
+        taus = torch.logspace(math.log10(tau_min), math.log10(tau_max), channels)
+        rho = torch.exp(-1.0 / taus).clamp(1e-4, 1 - 1e-4)
+        self.rho_logit = nn.Parameter(torch.log(rho) - torch.log1p(-rho))
+        self.gain = nn.Parameter(torch.full((channels,), float(gain_init)))
+
+    def forward(self, write: torch.Tensor, previous: dict | None):
+        """previous = {"trace": [B,...], "started": [B] bool} or None.
+
+        A sample whose `started` flag was cleared (episode reset, state dropout)
+        restarts exactly like an episode start, m_0 = w_0.
+        """
+        started = torch.ones(write.shape[0], dtype=torch.bool, device=write.device)
+        if previous is None:
+            trace = write
+        else:
+            rho = self.rho_logit.sigmoid()
+            blended = rho * previous["trace"] + (1.0 - rho) * write
+            mask = previous["started"].view(-1, *([1] * (write.dim() - 1)))
+            trace = torch.where(mask, blended, write)
+        return self.gain * trace, {"trace": trace, "started": started}

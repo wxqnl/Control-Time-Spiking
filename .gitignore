@@ -36,6 +36,7 @@ wandb/
 .env
 .env.*
 !.env.example
+!.env.cts.example
 .netrc
 .credentials*
 credentials*.json

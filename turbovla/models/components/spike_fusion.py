@@ -82,7 +82,8 @@ class SpikeBiMultiHeadAttention(BiMultiHeadAttention):
             raise ValueError("padding mask must be bool [B,N], where True means excluded")
         return ~padding.unsqueeze(-1)
 
-    def _forward_spike(self, v, l, attention_mask_v=None, attention_mask_l=None):
+    def _forward_spike(self, v, l, attention_mask_v=None, attention_mask_l=None,
+                       initial_state=None, return_state=False):
         if v.ndim != 3 or l.ndim != 3 or v.shape[0] != l.shape[0]:
             raise ValueError("vision and text must be [B,N,C] with the same batch size")
         bsz, nv, _ = v.shape
@@ -93,6 +94,10 @@ class SpikeBiMultiHeadAttention(BiMultiHeadAttention):
         source_count_l = valid_l.sum(1, keepdim=True).clamp_min(1).to(l.dtype)
         # No temporal state is kept in module attributes or checkpoint buffers.
         state = {name: None for name in self.spike_nodes}
+        if initial_state is not None:
+            # CTS: membranes carried from the previous control query.
+            from turbovla.cts.state import wrap_carried
+            state.update(wrap_carried(initial_state))
         output_v, output_l = None, None
 
         def fire(name, current, valid, scale=1.0):
@@ -123,15 +128,17 @@ class SpikeBiMultiHeadAttention(BiMultiHeadAttention):
             output_l = dl if output_l is None else output_l + dl
         keep_v = valid_v & valid_l.any(1, keepdim=True)
         keep_l = valid_l & valid_v.any(1, keepdim=True)
-        return (
+        outputs = (
             (output_v / self.timesteps).masked_fill(~keep_v, 0.0),
             (output_l / self.timesteps).masked_fill(~keep_l, 0.0),
         )
+        return (*outputs, state) if return_state else outputs
 
-    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None):
+    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None,
+                initial_state=None, return_state=False):
         if self.training and torch.is_grad_enabled() and self.gradient_checkpointing:
             return checkpoint(
                 self._forward_spike, v, l, attention_mask_v, attention_mask_l,
-                use_reentrant=False,
+                initial_state, return_state, use_reentrant=False,
             )
-        return self._forward_spike(v, l, attention_mask_v, attention_mask_l)
+        return self._forward_spike(v, l, attention_mask_v, attention_mask_l, initial_state, return_state)

@@ -151,6 +151,8 @@ class MaskedTemporalBatchNorm(nn.Module):
         self.register_buffer("num_batches_tracked", torch.zeros(timesteps, dtype=torch.long))
         self.register_buffer("observed_tokens", torch.zeros(timesteps, dtype=torch.float64))
         self.calibrating = False
+        # CTS ablation: one set of statistics for all neuron steps (index 0).
+        self.time_shared = False
 
     def reset_running_stats(self):
         self.running_mean.zero_()
@@ -185,6 +187,8 @@ class MaskedTemporalBatchNorm(nn.Module):
     def forward(self, current, valid=None, time_index=0):
         if current.shape[-1] != self.channels or not 0 <= time_index < self.timesteps:
             raise ValueError("Invalid current shape or SNN timestep for normalization")
+        if self.time_shared:
+            time_index = 0
         x = current.float()
         if valid is None:
             valid = torch.ones((*x.shape[:-1], 1), device=x.device, dtype=torch.bool)
@@ -230,7 +234,8 @@ def verify_running_norms(model):
     if not norms:
         raise RuntimeError("No WTA running-normalization modules found")
     for name, module in norms:
-        if (module.num_batches_tracked <= 0).any() or (module.observed_tokens < 2).any():
+        steps = slice(0, 1) if getattr(module, "time_shared", False) else slice(None)
+        if (module.num_batches_tracked[steps] <= 0).any() or (module.observed_tokens[steps] < 2).any():
             raise RuntimeError(f"Missing training statistics at {name}")
         if (not torch.isfinite(module.running_mean).all()
                 or not torch.isfinite(module.running_var).all()

@@ -98,6 +98,45 @@ class ActionHeadConfig:
 
 
 @dataclass
+class CTSConfig:
+    """Control-Time Spiking. Disabled by default; old checkpoints have no `cts` entry.
+
+    neuron: <charge>_<reset>. charge "plif" is the repository's EMA form
+    v = u + g(I - u); "if" accumulates v = u + g*I. reset "hard" zeroes the
+    membrane after a spike, "soft" subtracts the threshold. plif_hard with all
+    carry flags off and memory off reproduces the base model exactly.
+    carry_*: keep the membrane of that scope across control queries of one
+    episode, scaled by a learnable per-channel retention.
+    memory: C2 persistent dendritic trace on the instruction-token stream;
+    memory_vision adds the same trace on the visual-token stream (ablation).
+    """
+
+    enabled: bool = False
+    neuron: str = "if_soft"
+    residual_clamp: bool = True
+    carry_projection: bool = True
+    carry_fusion: bool = True
+    carry_head: bool = True
+    carry_retention_init: float = 0.9
+    carry_retention_learnable: bool = True
+    memory: bool = True
+    memory_tau_min: float = 1.0
+    memory_tau_max: float = 16.0
+    memory_gain_init: float = 1e-4
+    memory_vision: bool = False
+    history_tokens: bool = False
+    shared_time_norm: bool = False
+
+    @property
+    def any_carry(self) -> bool:
+        return self.carry_projection or self.carry_fusion or self.carry_head
+
+    @property
+    def stateful(self) -> bool:
+        return self.enabled and (self.any_carry or self.memory or self.memory_vision or self.history_tokens)
+
+
+@dataclass
 class TurboVLAConfig:
     name: str = "TurboVLA"
     text_mask_version: str = "corrected"
@@ -107,6 +146,7 @@ class TurboVLAConfig:
     vision: VisionEncoderConfig = field(default_factory=VisionEncoderConfig)
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
     action: ActionHeadConfig = field(default_factory=ActionHeadConfig)
+    cts: CTSConfig = field(default_factory=CTSConfig)
 
     def __post_init__(self) -> None:
         if self.name != "TurboVLA":
@@ -241,6 +281,24 @@ class TurboVLAConfig:
                 raise ValueError("Population bin count and range must be positive")
             if self.action.spike_timesteps < 1 or self.vision.compute_precision != "fp32":
                 raise ValueError("Full state WTA requires positive neuron time and FP32 vision")
+        if self.cts.enabled:
+            if self.cts.neuron not in {"plif_hard", "plif_soft", "if_hard", "if_soft"}:
+                raise ValueError("cts.neuron must be plif_hard, plif_soft, if_hard or if_soft")
+            if (self.interaction.backbone_type != "spike_text_only"
+                    or not self.interaction.text_only_spike_projections):
+                raise ValueError("CTS is defined on spike_text_only with spike projections (the base upstream)")
+            cts_heads = {"ann", "full_spike_state8_shiftmax", "full_spike_state8_shiftmax_continuous_inputs",
+                         "full_spike_state8_shiftmax_continuous_inputs_ann_ffn", "full_spike_state8_shiftmax_ann_ffn"}
+            if self.action.head_type not in cts_heads:
+                raise ValueError(f"CTS supports action heads {sorted(cts_heads)}")
+            if self.action.head_type == "ann" and self.cts.carry_head:
+                raise ValueError("An ANN action head has no neuron state; set cts.carry_head=false")
+            if self.action.head_type == "ann" and self.cts.history_tokens:
+                raise ValueError("History tokens are implemented for the spike action heads")
+            if not 0.0 < self.cts.carry_retention_init < 1.0:
+                raise ValueError("cts.carry_retention_init must be in (0, 1)")
+            if not 0.0 < self.cts.memory_tau_min <= self.cts.memory_tau_max:
+                raise ValueError("cts memory timescales must satisfy 0 < tau_min <= tau_max")
 
     @property
     def sentence_mask_version(self) -> str:
@@ -266,4 +324,5 @@ class TurboVLAConfig:
             vision=VisionEncoderConfig(**dict(data.get("vision", {}))),
             interaction=InteractionConfig(**dict(data.get("interaction", {}))),
             action=ActionHeadConfig(**dict(data.get("action", {}))),
+            cts=CTSConfig(**dict(data.get("cts") or {})),
         )

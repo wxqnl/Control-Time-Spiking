@@ -345,17 +345,38 @@ class BiAttentionBlock(nn.Module):
         self.gamma_l = nn.Parameter(init_values * torch.ones((l_dim)), requires_grad=True)
         self.residual_style = residual_style
 
-    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None):
+    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None, cts_state=None, return_state=False):
         residual_v, residual_l = v, l
         v = self.layer_norm_v(v)
         l = self.layer_norm_l(l)
-        delta_v, delta_l = self.attn(
-            v, l, attention_mask_v=attention_mask_v, attention_mask_l=attention_mask_l
-        )
+        if return_state:
+            # CTS: neuron membranes and the dendritic trace cross control queries.
+            cts_state = cts_state or {}
+            delta_v, delta_l, attn_state = self.attn(
+                v, l, attention_mask_v=attention_mask_v, attention_mask_l=attention_mask_l,
+                initial_state=cts_state.get("attn"), return_state=True,
+            )
+        else:
+            cts_state = {}
+            delta_v, delta_l = self.attn(
+                v, l, attention_mask_v=attention_mask_v, attention_mask_l=attention_mask_l
+            )
         if self.residual_style == "pre_norm":
             v, l = residual_v, residual_l
         v = v + self.drop_path(self.gamma_v * delta_v)
         l = l + self.drop_path(self.gamma_l * delta_l)
+        memory = getattr(self, "cts_memory", None)
+        memory_state = memory_v_state = None
+        if memory is not None:
+            # C2: the instruction tokens integrate what vision wrote into them.
+            contribution, memory_state = memory(self.gamma_l * delta_l, cts_state.get("memory"))
+            l = l + contribution
+        memory_v = getattr(self, "cts_memory_v", None)
+        if memory_v is not None:
+            contribution, memory_v_state = memory_v(self.gamma_v * delta_v, cts_state.get("memory_v"))
+            v = v + contribution
+        if return_state:
+            return v, l, {"attn": attn_state, "memory": memory_state, "memory_v": memory_v_state}
         return v, l
 
     # def forward(self, v:List[torch.Tensor], l, attention_mask_v=None, attention_mask_l=None)

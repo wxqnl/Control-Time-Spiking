@@ -15,6 +15,19 @@ LIBERO 新实验入口：`python -m experiments.libero.train_action_head --varia
 
 安装与数据准备见下文；[历史变体](docs/action_head_variants.md)和[实验结果](docs/results.md)单独保存。
 
+## CTS（Control-Time Spiking，`cts` 分支）
+
+在 base 上让神经元时间与控制时间对齐：每次查询只跑 T_q=2 步的 IF-soft 神经元，膜电位在回合内跨查询保留（逐通道可学习保留率），指令 token 流带持久树突迹；训练用同一回合的连续查询窗口，每步监督查询数与 base 相同。取 base 神经元（plif_hard）并关闭 carry 与记忆时，与 base 逐位一致（有测试）。方案与实现差异见 [docs/cts/research_plan.md](docs/cts/research_plan.md)，训练 / 评估 / 消融的完整命令见 [docs/cts/EXPERIMENTS.md](docs/cts/EXPERIMENTS.md)。
+
+| 内容 | 位置 |
+| --- | --- |
+| 神经元、树突记忆、状态工具、窗口数据、训练器 | [turbovla/cts/](turbovla/cts/) |
+| 模型接入（`forward_cts`、`forward_window`）、配置 `CTSConfig` | [turbovla.py](turbovla/models/turbovla.py)、[configuration.py](turbovla/models/configuration.py) |
+| 回合级状态的评估策略、rollout 扰动与轨迹 | [policy.py](turbovla/evaluation/policy.py)、[rollout.py](third_party/vla_adapter/vla_adapter/rollout.py) |
+| 配方、启动、评估、汇总、诊断、效率 | [experiments/cts/](experiments/cts/) |
+| 环境与资产脚本、环境变量模板 | [scripts/cts/](scripts/cts/)、[.env.cts.example](.env.cts.example) |
+| 测试 | [tests/cts/](tests/cts/) |
+
 ## 扩展与历史入口
 
 <a id="historical-results"></a>

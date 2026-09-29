@@ -1,0 +1,286 @@
+{
+  "version": "2026-09-29",
+  "base_variant": "spike-driven-vla",
+  "budget": {
+    "global_loss_queries_per_step": 256,
+    "max_steps": 40000,
+    "note": "Every recipe sees 256 supervised control queries per optimizer step for 40k steps (10.24M), the spike-driven-vla budget. world_size x windows_per_gpu x grad_accum x K must equal 256."
+  },
+  "cts_defaults": {
+    "neuron": "if_soft",
+    "residual_clamp": true,
+    "carry_projection": true,
+    "carry_fusion": true,
+    "carry_head": true,
+    "carry_retention_init": 0.9,
+    "carry_retention_learnable": true,
+    "memory": true,
+    "memory_tau_min": 1.0,
+    "memory_tau_max": 16.0,
+    "memory_gain_init": 0.0001,
+    "history_tokens": false,
+    "shared_time_norm": false,
+    "window": 2,
+    "burn_in": 2,
+    "stride": 12,
+    "state_dropout": 0.1,
+    "lr_scale": 10.0,
+    "memory_vision": false
+  },
+  "recipes": {
+    "E0-base": {
+      "entry": "base",
+      "group": "E0",
+      "label": "spike-driven-vla base reproduction (same machine, same seed as CTS runs)",
+      "base_overrides": {}
+    },
+    "E0d-base-T2": {
+      "entry": "base",
+      "group": "E0",
+      "label": "base with Cross/projection T=2 (quantifies the intra-query T cost CTS removes)",
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E0d-base-T1": {
+      "entry": "base",
+      "group": "E0",
+      "label": "base with T=1",
+      "base_overrides": {
+        "--cross_timesteps": "1"
+      }
+    },
+    "E0e-ann-upper": {
+      "entry": "ann",
+      "group": "E0",
+      "label": "DINOv3 + BERT + ANN fusion/head upper bound (repo --preset ann) on the base budget: 40k x 256, light aug, same KD"
+    },
+    "E1-cts": {
+      "entry": "cts",
+      "group": "E1",
+      "label": "CTS main: T_q=2 per query (half the base steps), IF-soft + control-time carry + instruction memory, K=2 windows",
+      "cts": {},
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E1-cts-T4": {
+      "entry": "cts",
+      "group": "E1",
+      "label": "CTS at the base T=4 per query (fallback if T_q=2 costs accuracy)",
+      "cts": {}
+    },
+    "E2a-if-soft-only": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "C1 alone at T_q=2: IF-soft neuron, no carry, no memory, single-query training",
+      "cts": {
+        "carry_projection": false,
+        "carry_fusion": false,
+        "carry_head": false,
+        "memory": false,
+        "window": 1,
+        "burn_in": 0,
+        "state_dropout": 0.0
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2a-if-hard-only": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "IF with hard reset, no carry, no memory, T_q=2 (separates integration from residual keeping)",
+      "cts": {
+        "neuron": "if_hard",
+        "carry_projection": false,
+        "carry_fusion": false,
+        "carry_head": false,
+        "memory": false,
+        "window": 1,
+        "burn_in": 0,
+        "state_dropout": 0.0
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2a-plif-carry": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "carry + memory with the base PLIF-hard neuron, T_q=2 (is the integrator needed for carry?)",
+      "cts": {
+        "neuron": "plif_hard"
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2b-no-carry": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "C1 + instruction memory, no membrane carry (retention = 0)",
+      "cts": {
+        "carry_projection": false,
+        "carry_fusion": false,
+        "carry_head": false
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2b-no-head-carry": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "carry in projection+fusion only (the head restarts every query)",
+      "cts": {
+        "carry_head": false
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2b-fixed-retention": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "retention frozen at 0.9 (learned per-channel time constants vs fixed)",
+      "cts": {
+        "carry_retention_learnable": false
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2c-no-memory": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "C1 + carry, no dendritic memory",
+      "cts": {
+        "memory": false
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2c-memory-vision": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "memory on the instruction and the visual stream",
+      "cts": {
+        "memory_vision": true
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2d-cts-T1": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "CTS at T_q=1 (with E1-cts T_q=2 and E1-cts-T4 gives the steps/accuracy curve)",
+      "cts": {},
+      "base_overrides": {
+        "--cross_timesteps": "1"
+      }
+    },
+    "E2e-K4": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "longer windows: K=4 loss queries, 8 windows/GPU",
+      "cts": {
+        "window": 4
+      },
+      "windows_per_gpu": 8,
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2e-no-burnin": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "no burn-in (every window starts cold)",
+      "cts": {
+        "burn_in": 0
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2e-no-dropout": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "no state dropout",
+      "cts": {
+        "state_dropout": 0.0
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2e-dropout0.3": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "state dropout 0.3",
+      "cts": {
+        "state_dropout": 0.3
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E2f-shared-norm": {
+      "entry": "cts",
+      "group": "E2",
+      "label": "one BN statistic for all timesteps (timestep-indexed BN is a hidden clock under carry)",
+      "cts": {
+        "shared_time_norm": true
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "E3-history-tokens": {
+      "entry": "cts",
+      "group": "E3",
+      "label": "explicit-memory baseline at the base T=4: previous-query visual tokens appended to the head memory, base neuron, no carry",
+      "cts": {
+        "neuron": "plif_hard",
+        "carry_projection": false,
+        "carry_fusion": false,
+        "carry_head": false,
+        "memory": false,
+        "history_tokens": true,
+        "burn_in": 1
+      }
+    },
+    "E6-cts-stride6": {
+      "entry": "cts",
+      "group": "E6",
+      "label": "optional: CTS trained for 6-step replanning (evaluate with --num_open_loop_steps 6)",
+      "cts": {
+        "stride": 6
+      },
+      "base_overrides": {
+        "--cross_timesteps": "2"
+      }
+    },
+    "P0-pilot-finetune": {
+      "entry": "cts",
+      "group": "pilot",
+      "label": "cheap signal: CTS (T=4, same T as the loaded base) fine-tuned 5k steps from the trained base EMA; not a paper number",
+      "cts": {},
+      "requires_init_checkpoint": true,
+      "max_steps": 5000,
+      "base_overrides": {
+        "--lr_warmup_samples": "0",
+        "--warmup_steps": "500",
+        "--save_steps": "1000",
+        "--cross_timesteps": "4"
+      }
+    }
+  },
+  "notes": [
+    "T_q (cross_timesteps) is 2 for every CTS recipe except E1-cts-T4, E3 and the pilot, which keep the base T=4.",
+    "K=3 is not offered: 256 loss queries per step is not divisible by 3.",
+    "E2-f 'no EMA BN refresh' is an evaluation variant: evaluate.py --weights raw on the E1-cts training checkpoint."
+  ]
+}

@@ -87,6 +87,21 @@ class GenerateConfig:
     text_sentence_mask_override: str = ""
     dinov3_output_hidden_states: bool = True
 
+    # Control-Time Spiking diagnostics and stress tests. The defaults keep the
+    # standard protocol; a stateless checkpoint ignores the cts_* options.
+    trace_dir: str = ""                 # per-episode goal-predicate traces (failure taxonomy)
+    cts_reset_every: int = 0            # >0: cold-start the CTS state every N queries
+    cts_carry_precision: str = "fp32"   # fp32 | bf16 | fp16 storage of the carried state
+    cts_reset_at_query: int = -1        # >=0: clear the CTS state once, before this query
+    perturb_mode: str = ""              # "" | blackout | noise | brightness
+    perturb_start_query: int = 4
+    perturb_queries: int = 2
+    perturb_views: str = "primary"      # primary | wrist | both
+    perturb_noise_std: float = 25.0     # uint8 pixel units
+    perturb_brightness: float = 1.3     # brightness factor
+    numerics_stress: str = ""           # "" | tf32
+    weight_bits: int = 0                # >0: fake-quantize policy weights to int-k
+
 
 def _parse_bool(value) -> bool:
     if isinstance(value, bool):
@@ -231,6 +246,15 @@ def _result_path(cfg: GenerateConfig) -> Path:
     return Path(cfg.video_out_path) / f"{ckpt_tag}_{cfg.task_suite_name}_results.json"
 
 
+def _goal_predicates(env) -> list[bool] | None:
+    """Truth value of every BDDL goal predicate, or None if the env hides them."""
+    inner = getattr(env, "env", None)
+    problem = getattr(inner, "parsed_problem", None)
+    if inner is None or not isinstance(problem, dict) or "goal_state" not in problem:
+        return None
+    return [bool(inner._eval_predicate(state)) for state in problem["goal_state"]]
+
+
 def _run_episode(
     cfg: GenerateConfig,
     env,
@@ -239,14 +263,19 @@ def _run_episode(
     initial_state: np.ndarray,
     get_libero_dummy_action,
     rotate_libero_image,
+    trace: dict | None = None,
+    rng: np.random.Generator | None = None,
 ) -> tuple[bool, list[np.ndarray], list[list[float]]]:
     env.reset()
     obs = env.set_init_state(initial_state)
+    if hasattr(policy, "reset_episode"):
+        policy.reset_episode()
     action_queue: deque[np.ndarray] = deque()
     replay_images: list[np.ndarray] = []
     executed_actions: list[list[float]] = []
     dummy_action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    query_index = 0
 
     success = False
     for t in range(max_steps + cfg.num_steps_wait):
@@ -256,9 +285,17 @@ def _run_episode(
 
         primary = rotate_libero_image(obs["agentview_image"])
         wrist = rotate_libero_image(obs["robot0_eye_in_hand_image"])
-        replay_images.append(np.concatenate([primary, wrist], axis=1))
 
         if not action_queue:
+            if query_index == cfg.cts_reset_at_query and getattr(policy, "cts_stateful", False):
+                policy.reset_episode()
+            perturbed = False
+            if cfg.perturb_mode:
+                from turbovla.cts.robustness import perturb_observation
+                primary, wrist, perturbed = perturb_observation(primary, wrist, query_index, cfg, rng)
+            if trace is not None:
+                trace["queries"].append({"step": t - cfg.num_steps_wait, "perturbed": perturbed,
+                                         "goal": _goal_predicates(env)})
             env_actions = policy.predict_env_action_chunk(
                 primary,
                 wrist,
@@ -267,6 +304,8 @@ def _run_episode(
                 execute_steps=cfg.num_open_loop_steps,
             )
             action_queue.extend(np.asarray(row, dtype=np.float32) for row in env_actions)
+            query_index += 1
+        replay_images.append(np.concatenate([primary, wrist], axis=1))
 
         action = action_queue.popleft() if action_queue else dummy_action
         executed_actions.append(action.tolist())
@@ -275,6 +314,8 @@ def _run_episode(
             success = True
             break
 
+    if trace is not None:
+        trace.update(success=success, steps=len(executed_actions), final_goal=_goal_predicates(env))
     return success, replay_images, executed_actions
 
 
@@ -339,6 +380,18 @@ def eval_libero(cfg: GenerateConfig) -> float:
         dinov3_output_hidden_states=cfg.dinov3_output_hidden_states,
     )
 
+    stress = {}
+    if getattr(policy, "cts_stateful", False):
+        if cfg.cts_carry_precision not in {"fp32", "bf16", "fp16"}:
+            raise ValueError("cts_carry_precision must be fp32, bf16 or fp16")
+        policy.cts_reset_every = cfg.cts_reset_every
+        policy.cts_carry_precision = cfg.cts_carry_precision
+    if cfg.numerics_stress or cfg.weight_bits:
+        from turbovla.cts.robustness import apply_numerics_stress, fake_quantize_weights
+        stress.update(apply_numerics_stress(policy, cfg.numerics_stress))
+        stress.update(fake_quantize_weights(policy.model, cfg.weight_bits))
+        logging.info("Deployment stress: %s", stress)
+
     if cfg.dry_run_model_load:
         logging.info("dry_run_model_load=True; exiting before LIBERO rollout.")
         return 0.0
@@ -378,6 +431,19 @@ def eval_libero(cfg: GenerateConfig) -> float:
         "control_mode": cfg.control_mode,
         "env_img_res": cfg.env_img_res,
         "dinov3_output_hidden_states": cfg.dinov3_output_hidden_states,
+        "cts": {
+            "stateful": bool(getattr(policy, "cts_stateful", False)),
+            "config": policy.model.config.cts.__dict__ if hasattr(policy.model.config, "cts") else None,
+            "reset_every": cfg.cts_reset_every,
+            "reset_at_query": cfg.cts_reset_at_query,
+            "carry_precision": cfg.cts_carry_precision,
+        },
+        "perturbation": {
+            "mode": cfg.perturb_mode, "start_query": cfg.perturb_start_query,
+            "queries": cfg.perturb_queries, "views": cfg.perturb_views,
+            "noise_std": cfg.perturb_noise_std, "brightness": cfg.perturb_brightness,
+        } if cfg.perturb_mode else None,
+        "deployment_stress": stress or None,
         "tasks": [],
         "total_episodes": 0,
         "total_successes": 0,
@@ -405,8 +471,14 @@ def eval_libero(cfg: GenerateConfig) -> float:
         env, task_description = _make_libero_env(task, cfg)
         task_successes = 0
         task_episodes = 0
+        episode_successes = []
         try:
             for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task), desc=f"task {task_id}", leave=False):
+                trace = ({"suite": cfg.task_suite_name, "task_id": task_id, "episode": episode_idx,
+                          "task_description": task_description, "queries": []}
+                         if cfg.trace_dir else None)
+                # Perturbation noise is seeded per episode, independent of the policy.
+                rng = np.random.default_rng([cfg.seed, task_id, episode_idx])
                 success, replay_images, executed_actions = _run_episode(
                     cfg,
                     env,
@@ -415,9 +487,16 @@ def eval_libero(cfg: GenerateConfig) -> float:
                     initial_states[episode_idx],
                     get_libero_dummy_action,
                     rotate_libero_image,
+                    trace=trace,
+                    rng=rng,
                 )
+                if trace is not None:
+                    trace_path = Path(cfg.trace_dir) / cfg.task_suite_name / f"task{task_id:02d}_ep{episode_idx:03d}.json"
+                    trace_path.parent.mkdir(parents=True, exist_ok=True)
+                    trace_path.write_text(json.dumps(trace), encoding="utf-8")
                 task_episodes += 1
                 total_episodes += 1
+                episode_successes.append(bool(success))
                 if success:
                     task_successes += 1
                     total_successes += 1
@@ -445,6 +524,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
                 "episodes": task_episodes,
                 "successes": task_successes,
                 "success_rate": task_rate,
+                # Episode i uses initial state i, so runs are paired per episode.
+                "episode_successes": episode_successes,
             }
         )
         logging.info("task=%d success_rate=%.4f (%d/%d)", task_id, task_rate, task_successes, task_episodes)

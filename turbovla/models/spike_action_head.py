@@ -230,21 +230,32 @@ class SpikeACTDecoder(nn.Module):
         )
         self.action_projection = SpikeActionReadout(config, hidden_dim, interaction)
 
-    def forward(self, memories, memory_valid):
+    def forward(self, memories, memory_valid, initial_state=None, return_state=False):
+        carried = return_state or initial_state is not None
+        if carried:
+            # CTS: each layer and the readout resume from carried membranes.
+            from turbovla.cts.state import wrap_carried
+            initial_state = initial_state or {}
+            layer_states = initial_state.get("layers") or [None] * len(self.layers)
         queries = self.action_queries.weight[None].expand(memories.shape[1], -1, -1)
         sequence = queries[None].expand(memories.shape[0], -1, -1, -1)
-        for layer in self.layers:
-            state = {}
+        final_layers = []
+        for index, layer in enumerate(self.layers):
+            state = wrap_carried(layer_states[index]) if carried else {}
             sequence = torch.stack([
                 layer.forward_step(sequence[t], memories[t], memory_valid, state, t)
                 for t in range(memories.shape[0])
             ])
-        state = {}
+            final_layers.append(state)
+        state = wrap_carried(initial_state.get("readout")) if carried else {}
         currents = [
             self.action_projection.forward_step(sequence[t], state, t)
             for t in range(memories.shape[0])
         ]
-        return torch.tanh(torch.stack(currents).mean(0))
+        actions = torch.tanh(torch.stack(currents).mean(0))
+        if return_state:
+            return actions, {"layers": final_layers, "readout": state}
+        return actions
 
     @torch.no_grad()
     def load_common(self, original):
@@ -274,7 +285,7 @@ class SpikeTurboVLAActionHead(nn.Module):
             self.state_projection.load_common(original.state_projection)
         self.decoder.load_common(original.decoder)
 
-    def _forward(self, memory, state, memory_key_padding_mask):
+    def _forward(self, memory, state, memory_key_padding_mask, initial_state=None, return_state=False):
         state_state, memories = {}, []
         continuous_tokens = self.state_projection(state) if self.config.continuous_state else None
         # A already reads out its fusion timesteps. Integrate that unchanged
@@ -287,9 +298,11 @@ class SpikeTurboVLAActionHead(nn.Module):
             (state.shape[0], self.config.num_state_tokens), device=memory.device, dtype=torch.bool
         )
         valid = torch.cat((~memory_key_padding_mask, state_valid), dim=1)[..., None]
+        if return_state or initial_state is not None:
+            return self.decoder(torch.stack(memories), valid, initial_state, return_state)
         return self.decoder(torch.stack(memories), valid)
 
-    def forward(self, memory, state, memory_key_padding_mask=None):
+    def forward(self, memory, state, memory_key_padding_mask=None, initial_state=None, return_state=False):
         if memory.dtype != torch.float32 or state.dtype != torch.float32:
             raise ValueError("The spike action head requires FP32 inputs")
         if state.ndim == 3:
@@ -305,7 +318,7 @@ class SpikeTurboVLAActionHead(nn.Module):
             raise ValueError("Action memory padding mask must be bool [B,N]")
         if self.training and torch.is_grad_enabled() and self.config.spike_gradient_checkpointing:
             return checkpoint(
-                self._forward, memory, state, memory_key_padding_mask,
+                self._forward, memory, state, memory_key_padding_mask, initial_state, return_state,
                 use_reentrant=False, context_fn=checkpoint_contexts,
             )
-        return self._forward(memory, state, memory_key_padding_mask)
+        return self._forward(memory, state, memory_key_padding_mask, initial_state, return_state)

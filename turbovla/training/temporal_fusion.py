@@ -10,7 +10,7 @@ def common_pretrained_names(model):
     interaction = model.vision_language_interaction
     if model.config.interaction.backbone_type == "spike_text_only":
         return {name for name, _ in interaction.named_parameters()
-                if ".spike_nodes." not in name and ".norms." not in name}
+                if ".spike_nodes." not in name and ".norms." not in name and ".cts_memory" not in name}
     return interaction.common_pretrained_parameter_names()
 
 

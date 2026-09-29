@@ -327,6 +327,9 @@ def build_model_architecture(args):
     model_args.position_embedding = "view"
     model_args.encode_views_separately = True
     model_args.padding_strategy = "key_padding_mask"
+    for name, value in vars(args).items():
+        if name.startswith("cts_"):
+            setattr(model_args, name, value)
     return build_turbovla(model_args)
 
 

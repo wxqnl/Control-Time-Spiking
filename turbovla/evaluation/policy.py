@@ -508,6 +508,34 @@ class TurboVLAPolicy:
             else build_dinov3_manual_processor(self.dinov3_path)
         )
         self.dinov3_processor = self.vision_processor
+        # Control-Time Spiking: episode state carried between control queries.
+        self.cts_stateful = self.model.config.cts.stateful
+        self.cts_reset_every = 0          # >0: cold-start every N queries (test-time ablation)
+        self.cts_carry_precision = "fp32"  # storage precision of the carried state (robustness)
+        self.reset_episode()
+
+    def reset_episode(self) -> None:
+        """Must be called at every episode start; CTS state never crosses episodes."""
+        self._cts_carry = None
+        self._cts_instruction = None
+        self._cts_queries = 0
+
+    def _cts_predict(self, instruction: str, samples, states):
+        from ..cts.state import map_tensors
+
+        if self._cts_instruction is not None and instruction != self._cts_instruction:
+            raise RuntimeError("Instruction changed inside a CTS episode; call reset_episode() first")
+        if self.cts_reset_every > 0 and self._cts_queries % self.cts_reset_every == 0:
+            self._cts_carry = None
+        pred, carry = self.model.forward_cts([instruction], samples, states, self._cts_carry)
+        if self.cts_carry_precision != "fp32":
+            dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[self.cts_carry_precision]
+            carry = {key: (value if key in {"instruction", "query_index"} else map_tensors(
+                value, lambda t: t.to(dtype).to(t.dtype) if t.is_floating_point() else t))
+                for key, value in carry.items()}
+        self._cts_carry, self._cts_instruction = carry, instruction
+        self._cts_queries += 1
+        return pred
 
     def _set_eval_precision(self) -> None:
         if self.precision == "bf16":
@@ -609,7 +637,10 @@ class TurboVLAPolicy:
         samples, states = self._build_batch([primary_image], [wrist_image], [state])
         samples, states = self._prepare_model_inputs(samples, states)
         with torch.inference_mode():
-            pred = self.model([instruction], samples, states)
+            if self.cts_stateful:
+                pred = self._cts_predict(instruction, samples, states)
+            else:
+                pred = self.model([instruction], samples, states)
         if pred.dtype != self.model_dtype:
             raise RuntimeError(
                 f"precision={self.precision} expected forward output dtype {self.model_dtype}, got {pred.dtype}"
